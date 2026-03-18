@@ -19,7 +19,7 @@ const L = {
     blurText: "Blur Text",
     blurTextHelp: "Auto-detect visible words and blur them in the blurred output",
     textFound: "Text regions",
-    textUnsupported: "Text detection depends on browser support",
+    textDetecting: "Detecting text…",
     isoSettings: "Isolation Settings",
     threshold: "Edge Threshold",
     thresholdHelp: "Higher = tighter cut, Lower = more included",
@@ -44,7 +44,7 @@ const L = {
     blurText: "模糊文字",
     blurTextHelp: "自动检测可见文字，并在模糊输出中一起处理",
     textFound: "文字区域",
-    textUnsupported: "文字检测取决于浏览器支持",
+    textDetecting: "正在检测文字…",
     isoSettings: "抠图设置",
     threshold: "边缘阈值",
     thresholdHelp: "越高越紧贴轮廓，越低包含越多",
@@ -93,7 +93,6 @@ export default function App() {
     { id: "mosaic", label: t.mosaic, icon: "▦" },
     { id: "black", label: t.blackout, icon: "■" },
   ];
-  const textDetectionSupported = typeof window !== "undefined" && "TextDetector" in window;
 
   // ── Load both models ───────────────────────────────────────────────────────
   const loadModels = useCallback(async () => {
@@ -129,29 +128,30 @@ export default function App() {
   useEffect(() => { loadModels(); }, [loadModels]);
 
   const detectTextRegions = useCallback(async (img) => {
-    if (!textDetectionSupported) return [];
     try {
-      const detector = new window.TextDetector();
-      const detections = await detector.detect(img);
-      return detections
-        .map((item) => {
-          const box = item?.boundingBox;
-          if (!box) return null;
-          const padX = Math.max(6, box.width * 0.08);
-          const padY = Math.max(4, box.height * 0.2);
-          return {
-            x: Math.max(0, box.x - padX),
-            y: Math.max(0, box.y - padY),
-            w: Math.max(1, Math.min(img.width - Math.max(0, box.x - padX), box.width + padX * 2)),
-            h: Math.max(1, Math.min(img.height - Math.max(0, box.y - padY), box.height + padY * 2)),
-          };
-        })
-        .filter(Boolean);
+      const Tesseract = await import("tesseract.js");
+      const { data } = await Tesseract.recognize(img, "eng+chi_sim", {
+        logger: () => {},
+      });
+      const regions = [];
+      for (const word of (data.words || [])) {
+        if (word.confidence < 40) continue;
+        const { x0, y0, x1, y1 } = word.bbox;
+        const padX = Math.max(4, (x1 - x0) * 0.1);
+        const padY = Math.max(3, (y1 - y0) * 0.15);
+        regions.push({
+          x: Math.max(0, x0 - padX),
+          y: Math.max(0, y0 - padY),
+          w: Math.min(img.width - Math.max(0, x0 - padX), (x1 - x0) + padX * 2),
+          h: Math.min(img.height - Math.max(0, y0 - padY), (y1 - y0) + padY * 2),
+        });
+      }
+      return regions;
     } catch (e) {
       console.warn("Text detection failed", e);
       return [];
     }
-  }, [textDetectionSupported]);
+  }, []);
 
   // ── Handle image ───────────────────────────────────────────────────────────
   const handleImage = useCallback(async (file) => {
@@ -191,7 +191,7 @@ export default function App() {
       } catch (e) { console.error(e); setErrorMsg(e.message); setStatus("error"); }
     };
     img.src = url;
-  }, [detectTextRegions, faceApi, segmenter, t.noFaceHint]);
+  }, [detectTextRegions, faceApi, segmenter, t.noFaceHint, blurText]);
 
   // ── Render blur canvas ─────────────────────────────────────────────────────
   const renderBlur = useCallback((img, canvas, faceBoxes, textRegions, mode, strength, expand, shouldBlurText) => {
@@ -408,7 +408,7 @@ export default function App() {
             <span>{t.blurText}</span>
           </label>
           <div className="sh">{t.blurTextHelp}</div>
-          <div className="sh">{t.textFound}: {textBoxes.length}{!textDetectionSupported ? ` · ${t.textUnsupported}` : ""}</div>
+          <div className="sh">{t.textFound}: {textBoxes.length}</div>
         </div>
       </div>
       <div className="ps">
