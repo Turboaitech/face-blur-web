@@ -20,7 +20,7 @@ const L = {
     threshold: "Edge Threshold",
     thresholdHelp: "Higher = tighter cut, Lower = more included",
     isoExpand: "Region Expand",
-    isoExpandHelp: "How far beyond face box to include (hair, shoulders)",
+    isoExpandHelp: "How far beyond face box to include (hair, chin)",
     morphClose: "Edge Smoothing",
     faces: "Detected Faces", face: "Face", detecting: "Processing…",
     noFace: "No faces detected", noFaceHint: "Try a clearer photo",
@@ -41,7 +41,7 @@ const L = {
     threshold: "边缘阈值",
     thresholdHelp: "越高越紧贴轮廓，越低包含越多",
     isoExpand: "区域扩展",
-    isoExpandHelp: "超出人脸框多远（包含头发、肩膀）",
+    isoExpandHelp: "超出人脸框多远（包含头发、下巴）",
     morphClose: "边缘平滑",
     faces: "检测到的人脸", face: "人脸", detecting: "处理中…",
     noFace: "未检测到人脸", noFaceHint: "可尝试换一张更清晰的照片",
@@ -63,7 +63,7 @@ export default function App() {
   const [blurStrength, setBlurStrength] = useState(40);
   const [blurExpand, setBlurExpand] = useState(0.3);
   const [isoThreshold, setIsoThreshold] = useState(0.5);
-  const [isoExpand, setIsoExpand] = useState(0.6);
+  const [isoExpand, setIsoExpand] = useState(0.35);
   const [morphIter, setMorphIter] = useState(1);
   const [errorMsg, setErrorMsg] = useState("");
   const [dragOver, setDragOver] = useState(false);
@@ -205,13 +205,13 @@ export default function App() {
     const enabledFaces = faceBoxes.filter(f => f.enabled);
     const regionMask = new Uint8Array(W * H);
     for (const f of enabledFaces) {
-      // Expand the face box significantly to include hair, neck, shoulders
+      // Expand the face box to include hair and chin — face only, not body
       const ex = f.w * expand;
       const ey = f.h * expand;
       const x0 = Math.max(0, Math.floor(f.x - ex));
-      const y0 = Math.max(0, Math.floor(f.y - ey * 0.5)); // less expansion above (forehead)
+      const y0 = Math.max(0, Math.floor(f.y - ey * 0.8)); // above for hair/forehead
       const x1 = Math.min(W, Math.ceil(f.x + f.w + ex));
-      const y1 = Math.min(H, Math.ceil(f.y + f.h + ey * 2.5)); // more expansion below (neck, shoulders)
+      const y1 = Math.min(H, Math.ceil(f.y + f.h + ey * 0.5)); // minimal below — chin only, no body
       for (let y = y0; y < y1; y++) {
         for (let x = x0; x < x1; x++) {
           regionMask[y * W + x] = 1;
