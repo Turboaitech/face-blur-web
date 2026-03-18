@@ -2,42 +2,48 @@
 
 import { useState, useRef, useCallback, useEffect } from "react";
 
-const MODEL_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.12/model/";
+const FACE_MODEL_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.12/model/";
+const SEG_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite";
+const SEG_WASM_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm";
 
 const L = {
   en: {
     title: "Face Blur & Isolate",
-    sub: "Upload an image — faces are auto-detected, blurred and isolated simultaneously. Everything runs in your browser.",
-    loading: "Loading model…", ready: "face-api.js · Ready", wait: "Initializing…",
+    sub: "Upload an image — faces are auto-detected. Simultaneously generates a blurred version and a pixel-accurate white-background isolation.",
+    loading: "Loading models…", ready: "Models ready", wait: "Initializing…",
     upload: "Click to select image, or drag & drop here",
     hint: "JPG / PNG / WebP", paste: "paste screenshot",
-    blurred: "Blurred", isolated: "Isolated on White",
+    blurred: "Blurred", isolated: "Isolated (White BG)",
     blurSettings: "Blur Settings", gaussian: "Gaussian", mosaic: "Mosaic", blackout: "Blackout",
     strength: "Strength", range: "Range",
-    isoSettings: "Isolate Settings", feather: "Edge Feather", expand: "Expand",
-    faces: "Detected Faces", face: "Face", detecting: "Detecting…",
+    isoSettings: "Isolation Settings",
+    threshold: "Edge Threshold",
+    thresholdHelp: "Higher = tighter cut, Lower = more included",
+    morphClose: "Edge Smoothing",
+    faces: "Detected Faces", face: "Face", detecting: "Processing…",
     noFace: "No faces detected", noFaceHint: "Try a clearer photo",
     dlBlur: "Download Blurred", dlIso: "Download Isolated", dlBoth: "Download Both",
-    reselect: "Choose Another Image",
+    reselect: "Choose Another Image", settings: "Settings",
     footer: "100% client-side · Images never leave your browser",
-    settings: "Settings",
   },
   zh: {
-    title: "人脸模糊 & 白底抠脸",
-    sub: "上传图片 → 自动检测人脸 → 同时生成模糊版和白底原位抠脸版，全程浏览器处理，不上传服务器。",
-    loading: "模型加载中…", ready: "face-api.js · 就绪", wait: "初始化中…",
+    title: "人脸模糊 & 白底抠图",
+    sub: "上传图片 → 自动检测 → 同时生成模糊版和精确白底抠图版。像素级分割，全程浏览器处理。",
+    loading: "模型加载中…", ready: "模型就绪", wait: "初始化中…",
     upload: "点击选择图片，或拖拽到此处",
     hint: "JPG / PNG / WebP", paste: "粘贴截图",
-    blurred: "模糊版", isolated: "白底抠脸版",
+    blurred: "模糊版", isolated: "白底抠图版",
     blurSettings: "模糊设置", gaussian: "高斯模糊", mosaic: "像素马赛克", blackout: "纯黑遮挡",
     strength: "模糊强度", range: "模糊范围",
-    isoSettings: "白底抠脸设置", feather: "边缘羽化", expand: "扩展范围",
-    faces: "检测到的人脸", face: "人脸", detecting: "检测中…",
+    isoSettings: "抠图设置",
+    threshold: "边缘阈值",
+    thresholdHelp: "越高越紧贴轮廓，越低包含越多",
+    morphClose: "边缘平滑",
+    faces: "检测到的人脸", face: "人脸", detecting: "处理中…",
     noFace: "未检测到人脸", noFaceHint: "可尝试换一张更清晰的照片",
     dlBlur: "下载模糊版", dlIso: "下载白底版", dlBoth: "全部下载",
-    reselect: "重选图片",
+    reselect: "重选图片", settings: "设置",
     footer: "纯前端处理 · 图片不会离开你的浏览器",
-    settings: "设置",
   },
 };
 
@@ -48,21 +54,24 @@ export default function App() {
   const [status, setStatus] = useState("idle");
   const [image, setImage] = useState(null);
   const [faces, setFaces] = useState([]);
+  const [segMask, setSegMask] = useState(null); // Float32Array of confidence per pixel
   const [blurMode, setBlurMode] = useState("gaussian");
   const [blurStrength, setBlurStrength] = useState(40);
   const [blurExpand, setBlurExpand] = useState(0.3);
-  const [isoFeather, setIsoFeather] = useState(20);
-  const [isoExpand, setIsoExpand] = useState(0.35);
+  const [isoThreshold, setIsoThreshold] = useState(0.5);
+  const [morphIter, setMorphIter] = useState(2);
   const [errorMsg, setErrorMsg] = useState("");
   const [dragOver, setDragOver] = useState(false);
   const [faceApi, setFaceApi] = useState(null);
-  const [modelLoaded, setModelLoaded] = useState(false);
+  const [segmenter, setSegmenter] = useState(null);
+  const [modelsLoaded, setModelsLoaded] = useState(false);
   const [panelOpen, setPanelOpen] = useState(false);
 
   const blurCanvasRef = useRef(null);
   const isoCanvasRef = useRef(null);
   const fileInputRef = useRef(null);
   const imgRef = useRef(null);
+  const imgDimsRef = useRef({ w: 0, h: 0 });
 
   const MODES = [
     { id: "gaussian", label: t.gaussian, icon: "◎" },
@@ -70,40 +79,74 @@ export default function App() {
     { id: "black", label: t.blackout, icon: "■" },
   ];
 
-  // ── Load model ─────────────────────────────────────────────────────────────
+  // ── Load both models ───────────────────────────────────────────────────────
   const loadModels = useCallback(async () => {
-    if (modelLoaded) return;
+    if (modelsLoaded) return;
     setStatus("loading-model");
     try {
+      // face-api for face detection (blur rectangles)
       const fa = await import("face-api.js");
-      await fa.nets.ssdMobilenetv1.loadFromUri(MODEL_URL);
-      setFaceApi(fa); setModelLoaded(true); setStatus("ready");
-    } catch (e) { console.error(e); setErrorMsg("Model load failed"); setStatus("error"); }
-  }, [modelLoaded]);
+      await fa.nets.ssdMobilenetv1.loadFromUri(FACE_MODEL_URL);
+      setFaceApi(fa);
+
+      // MediaPipe Selfie Segmenter for pixel-accurate person segmentation
+      const vision = await import("@mediapipe/tasks-vision");
+      const { ImageSegmenter, FilesetResolver } = vision;
+      const wasmFileset = await FilesetResolver.forVisionTasks(SEG_WASM_URL);
+      const seg = await ImageSegmenter.createFromOptions(wasmFileset, {
+        baseOptions: { modelAssetPath: SEG_MODEL_URL, delegate: "GPU" },
+        runningMode: "IMAGE",
+        outputConfidenceMasks: true,
+        outputCategoryMask: false,
+      });
+      setSegmenter(seg);
+
+      setModelsLoaded(true);
+      setStatus("ready");
+    } catch (e) {
+      console.error(e);
+      setErrorMsg("Model load failed: " + e.message);
+      setStatus("error");
+    }
+  }, [modelsLoaded]);
+
   useEffect(() => { loadModels(); }, [loadModels]);
 
   // ── Handle image ───────────────────────────────────────────────────────────
   const handleImage = useCallback(async (file) => {
     if (!file || !file.type.startsWith("image/")) return;
-    setFaces([]); setStatus("detecting"); setErrorMsg("");
+    setFaces([]); setSegMask(null); setStatus("detecting"); setErrorMsg("");
     const url = URL.createObjectURL(file); setImage(url);
+
     const img = new Image();
     img.onload = async () => {
       imgRef.current = img;
-      // init both canvases
+      imgDimsRef.current = { w: img.width, h: img.height };
       [blurCanvasRef, isoCanvasRef].forEach(r => { r.current.width = img.width; r.current.height = img.height; });
       blurCanvasRef.current.getContext("2d").drawImage(img, 0, 0);
-      if (!faceApi) { setErrorMsg("Model not ready"); setStatus("error"); return; }
+
+      if (!faceApi || !segmenter) { setErrorMsg("Models not ready yet"); setStatus("error"); return; }
+
       try {
+        // 1. Face detection for blur
         const det = await faceApi.detectAllFaces(img, new faceApi.SsdMobilenetv1Options({ minConfidence: 0.3 }));
         const boxes = det.map(d => ({ x: d.box.x, y: d.box.y, w: d.box.width, h: d.box.height, enabled: true }));
         setFaces(boxes);
         if (!boxes.length) setErrorMsg(t.noFaceHint);
+
+        // 2. Person segmentation for isolation
+        const result = segmenter.segment(img);
+        if (result.confidenceMasks && result.confidenceMasks.length > 0) {
+          const maskData = result.confidenceMasks[0].getAsFloat32Array();
+          // Store a copy since MediaPipe may reclaim the buffer
+          setSegMask(new Float32Array(maskData));
+        }
+
         setStatus("done");
       } catch (e) { console.error(e); setErrorMsg(e.message); setStatus("error"); }
     };
     img.src = url;
-  }, [faceApi, t.noFaceHint]);
+  }, [faceApi, segmenter, t.noFaceHint]);
 
   // ── Render blur canvas ─────────────────────────────────────────────────────
   const renderBlur = useCallback((img, canvas, faceBoxes, mode, strength, expand) => {
@@ -139,80 +182,107 @@ export default function App() {
     }
   }, []);
 
-  // ── Render isolate canvas (face stays, rest = white) ───────────────────────
-  const renderIsolate = useCallback((img, canvas, faceBoxes, feather, expand) => {
-    if (!img || !canvas) return;
+  // ── Render isolate canvas (pixel-accurate segmentation) ────────────────────
+  const renderIsolate = useCallback((img, canvas, mask, threshold, morphIterations) => {
+    if (!img || !canvas || !mask) return;
     const W = img.width, H = img.height;
     const ctx = canvas.getContext("2d");
 
-    // Start with original image in an offscreen canvas
+    // 1. Get original pixel data
     const srcCanvas = document.createElement("canvas");
     srcCanvas.width = W; srcCanvas.height = H;
-    srcCanvas.getContext("2d").drawImage(img, 0, 0);
+    const srcCtx = srcCanvas.getContext("2d");
+    srcCtx.drawImage(img, 0, 0);
+    const srcData = srcCtx.getImageData(0, 0, W, H);
 
-    // Build a mask: white where faces are, black elsewhere
-    const maskCanvas = document.createElement("canvas");
-    maskCanvas.width = W; maskCanvas.height = H;
-    const mctx = maskCanvas.getContext("2d");
-    // all black (transparent)
-    mctx.clearRect(0, 0, W, H);
-
-    for (const f of faceBoxes.filter(f => f.enabled)) {
-      const ex = f.w * expand, ey = f.h * expand;
-      const fx = Math.max(0, f.x - ex);
-      const fy = Math.max(0, f.y - ey * 1.1);
-      const fw = Math.min(W - fx, f.w + ex * 2);
-      const fh = Math.min(H - fy, f.h + ey * 2.5);
-      const cx = fx + fw / 2, cy = fy + fh / 2;
-      const rx = fw / 2, ry = fh / 2;
-      const maxR = Math.max(rx, ry);
-
-      // Radial gradient for soft edge
-      const gr = mctx.createRadialGradient(cx, cy, 0, cx, cy, maxR);
-      gr.addColorStop(0, "rgba(255,255,255,1)");
-      const featherStart = Math.max(0.5, 1 - feather / 100);
-      gr.addColorStop(featherStart, "rgba(255,255,255,1)");
-      gr.addColorStop(1, "rgba(255,255,255,0)");
-
-      mctx.save();
-      mctx.fillStyle = gr;
-      mctx.beginPath();
-      mctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
-      mctx.fill();
-      mctx.restore();
+    // 2. Create binary mask from confidence values
+    // mask is W*H float32 array, values 0.0-1.0 (person confidence)
+    const binaryMask = new Uint8Array(W * H);
+    for (let i = 0; i < W * H; i++) {
+      binaryMask[i] = mask[i] >= threshold ? 1 : 0;
     }
 
-    // Composite: white background + (original * mask)
-    // 1) fill white
-    ctx.fillStyle = "#ffffff";
-    ctx.fillRect(0, 0, W, H);
+    // 3. Morphological close (dilate then erode) to clean edges
+    const morphClose = (input, w, h, iterations) => {
+      let current = new Uint8Array(input);
+      for (let iter = 0; iter < iterations; iter++) {
+        // Dilate
+        const dilated = new Uint8Array(w * h);
+        for (let y = 0; y < h; y++) {
+          for (let x = 0; x < w; x++) {
+            let val = 0;
+            for (let dy = -1; dy <= 1; dy++) {
+              for (let dx = -1; dx <= 1; dx++) {
+                const nx = x + dx, ny = y + dy;
+                if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
+                  if (current[ny * w + nx]) { val = 1; break; }
+                }
+              }
+              if (val) break;
+            }
+            dilated[y * w + x] = val;
+          }
+        }
+        // Erode
+        const eroded = new Uint8Array(w * h);
+        for (let y = 0; y < h; y++) {
+          for (let x = 0; x < w; x++) {
+            let val = 1;
+            for (let dy = -1; dy <= 1; dy++) {
+              for (let dx = -1; dx <= 1; dx++) {
+                const nx = x + dx, ny = y + dy;
+                if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
+                  if (!dilated[ny * w + nx]) { val = 0; break; }
+                } else { val = 0; break; }
+              }
+              if (!val) break;
+            }
+            eroded[y * w + x] = val;
+          }
+        }
+        current = eroded;
+      }
+      return current;
+    };
 
-    // 2) draw mask
-    const compCanvas = document.createElement("canvas");
-    compCanvas.width = W; compCanvas.height = H;
-    const cctx = compCanvas.getContext("2d");
-    cctx.drawImage(maskCanvas, 0, 0);
-    cctx.globalCompositeOperation = "source-in";
-    cctx.drawImage(srcCanvas, 0, 0);
-    cctx.globalCompositeOperation = "source-over";
+    const cleanMask = morphIterations > 0
+      ? morphClose(binaryMask, W, H, morphIterations)
+      : binaryMask;
 
-    // 3) draw composited face onto white bg
-    ctx.drawImage(compCanvas, 0, 0);
+    // 4. Apply mask: person pixels from original, everything else = #FFFFFF
+    const outData = ctx.createImageData(W, H);
+    for (let i = 0; i < W * H; i++) {
+      const pi = i * 4;
+      if (cleanMask[i]) {
+        // Keep original pixel exactly
+        outData.data[pi]     = srcData.data[pi];
+        outData.data[pi + 1] = srcData.data[pi + 1];
+        outData.data[pi + 2] = srcData.data[pi + 2];
+        outData.data[pi + 3] = 255;
+      } else {
+        // Pure white
+        outData.data[pi]     = 255;
+        outData.data[pi + 1] = 255;
+        outData.data[pi + 2] = 255;
+        outData.data[pi + 3] = 255;
+      }
+    }
+    ctx.putImageData(outData, 0, 0);
   }, []);
 
-  // ── Re-render on any change ────────────────────────────────────────────────
+  // ── Re-render on changes ───────────────────────────────────────────────────
   useEffect(() => {
     if (status === "done" && imgRef.current) {
       renderBlur(imgRef.current, blurCanvasRef.current, faces, blurMode, blurStrength, blurExpand);
-      renderIsolate(imgRef.current, isoCanvasRef.current, faces, isoFeather, isoExpand);
+      renderIsolate(imgRef.current, isoCanvasRef.current, segMask, isoThreshold, morphIter);
     }
-  }, [status, faces, blurMode, blurStrength, blurExpand, isoFeather, isoExpand, renderBlur, renderIsolate]);
+  }, [status, faces, segMask, blurMode, blurStrength, blurExpand, isoThreshold, morphIter, renderBlur, renderIsolate]);
 
   // ── Actions ────────────────────────────────────────────────────────────────
   const toggleFace = (i) => setFaces(p => p.map((f, j) => j === i ? { ...f, enabled: !f.enabled } : f));
-  const dl = (canvas, name) => { if (!canvas) return; const a = document.createElement("a"); a.download = name; a.href = canvas.toDataURL("image/png"); a.click(); };
+  const dl = (c, name) => { if (!c) return; const a = document.createElement("a"); a.download = name; a.href = c.toDataURL("image/png"); a.click(); };
   const dlBoth = () => { dl(blurCanvasRef.current, "blurred.png"); setTimeout(() => dl(isoCanvasRef.current, "isolated.png"), 300); };
-  const reset = () => { setImage(null); setFaces([]); setStatus(modelLoaded ? "ready" : "idle"); setErrorMsg(""); setPanelOpen(false); };
+  const reset = () => { setImage(null); setFaces([]); setSegMask(null); setStatus(modelsLoaded ? "ready" : "idle"); setErrorMsg(""); setPanelOpen(false); };
 
   const onDragOver = (e) => { e.preventDefault(); setDragOver(true); };
   const onDragLeave = () => setDragOver(false);
@@ -224,7 +294,6 @@ export default function App() {
 
   const hasEnabled = faces.some(f => f.enabled);
 
-  // ── Panel contents (shared mobile/desktop) ─────────────────────────────────
   const panel = (
     <div className="pn">
       <div className="ps">
@@ -245,10 +314,11 @@ export default function App() {
       </div>
       <div className="ps">
         <h4>✂️ {t.isoSettings}</h4>
-        <div className="sg"><div className="sl"><span>{t.feather}</span><span>{isoFeather}</span></div>
-          <input type="range" min="0" max="50" value={isoFeather} onChange={e => setIsoFeather(+e.target.value)} /></div>
-        <div className="sg"><div className="sl"><span>{t.expand}</span><span>{Math.round(isoExpand * 100)}%</span></div>
-          <input type="range" min="10" max="80" value={isoExpand * 100} onChange={e => setIsoExpand(+e.target.value / 100)} /></div>
+        <div className="sg"><div className="sl"><span>{t.threshold}</span><span>{isoThreshold.toFixed(2)}</span></div>
+          <input type="range" min="10" max="90" value={isoThreshold * 100} onChange={e => setIsoThreshold(+e.target.value / 100)} />
+          <div className="sh">{t.thresholdHelp}</div></div>
+        <div className="sg"><div className="sl"><span>{t.morphClose}</span><span>{morphIter}</span></div>
+          <input type="range" min="0" max="5" value={morphIter} onChange={e => setMorphIter(+e.target.value)} /></div>
       </div>
       <div className="ps">
         <h4>{t.faces} ({faces.filter(f => f.enabled).length}/{faces.length})</h4>
@@ -268,9 +338,9 @@ export default function App() {
       <div className="bts">
         <div className="bt">
           <button className="bn b1" onClick={() => dl(blurCanvasRef.current, "blurred.png")} disabled={status !== "done" || !hasEnabled}>{t.dlBlur}</button>
-          <button className="bn b2" onClick={() => dl(isoCanvasRef.current, "isolated.png")} disabled={status !== "done" || !hasEnabled}>{t.dlIso}</button>
+          <button className="bn b2" onClick={() => dl(isoCanvasRef.current, "isolated.png")} disabled={status !== "done" || !segMask}>{t.dlIso}</button>
         </div>
-        <button className="bn b3" onClick={dlBoth} disabled={status !== "done" || !hasEnabled}>{t.dlBoth}</button>
+        <button className="bn b3" onClick={dlBoth} disabled={status !== "done"}>{t.dlBoth}</button>
         <button className="bn bg0" onClick={reset}>{t.reselect}</button>
       </div>
     </div>
@@ -297,21 +367,19 @@ body{font-family:var(--f);background:var(--bg);color:var(--t1);min-height:100vh;
 .app{max-width:1200px;margin:0 auto;padding:28px 16px 72px}
 @media(min-width:768px){.app{padding:44px 28px 80px}}
 
-/* ── Lang ── */
 .lang{position:fixed;top:12px;right:12px;z-index:100;display:flex;
   background:var(--s2);border:1px solid var(--bd);border-radius:20px;padding:2px;font-size:.73rem}
 .lang button{padding:4px 12px;border:none;border-radius:18px;background:none;
   color:var(--t2);cursor:pointer;transition:all .2s;font-family:var(--f);font-weight:500}
 .lang button.on{background:var(--s3);color:var(--t1)}
 
-/* ── Header ── */
 .hd{text-align:center;margin-bottom:32px}
 @media(min-width:768px){.hd{margin-bottom:48px}}
 .hd h1{font-size:1.5rem;font-weight:700;letter-spacing:-.03em;line-height:1.3;
   background:linear-gradient(135deg,var(--t1),var(--ac) 50%,var(--pk));
   -webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:6px}
 @media(min-width:768px){.hd h1{font-size:2.3rem}}
-.hd p{color:var(--t2);font-size:.82rem;font-weight:300;max-width:540px;margin:0 auto;line-height:1.6}
+.hd p{color:var(--t2);font-size:.82rem;font-weight:300;max-width:560px;margin:0 auto;line-height:1.6}
 @media(min-width:768px){.hd p{font-size:.92rem}}
 .badge{display:inline-flex;align-items:center;gap:6px;margin-top:10px;padding:3px 12px;
   background:var(--s1);border:1px solid var(--bd);border-radius:100px;font-size:.7rem;color:var(--t2);font-family:var(--m)}
@@ -319,7 +387,6 @@ body{font-family:var(--f);background:var(--bg);color:var(--t1);min-height:100vh;
 .dot.ld{background:var(--yl)}.dot.er{background:var(--rd);animation:none}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 
-/* ── Upload ── */
 .uz{border:2px dashed var(--bd);border-radius:var(--r);padding:48px 16px;text-align:center;
   cursor:pointer;transition:all .3s;background:var(--s1)}
 @media(min-width:768px){.uz{padding:72px 32px}}
@@ -331,11 +398,9 @@ body{font-family:var(--f);background:var(--bg);color:var(--t1);min-height:100vh;
 .uz-h{font-size:.75rem;color:var(--t2)}
 .uz-h kbd{background:var(--s2);border:1px solid var(--bd);border-radius:4px;padding:1px 5px;font-family:var(--m);font-size:.68rem}
 
-/* ── Workspace ── */
 .ws{display:flex;flex-direction:column;gap:16px}
 @media(min-width:900px){.ws{display:grid;grid-template-columns:1fr 280px;gap:20px;align-items:start}}
 
-/* ── Dual output ── */
 .duo{display:flex;flex-direction:column;gap:12px}
 @media(min-width:600px){.duo{display:grid;grid-template-columns:1fr 1fr;gap:16px}}
 .out{position:relative;background:var(--s1);border:1px solid var(--bd);border-radius:var(--r);overflow:hidden}
@@ -344,11 +409,10 @@ body{font-family:var(--f);background:var(--bg);color:var(--t1);min-height:100vh;
   border-radius:6px;padding:3px 10px;font-size:.7rem;font-weight:600;color:var(--t2);pointer-events:none}
 .out-label.lb{border-left:2px solid var(--ac)}
 .out-label.li{border-left:2px solid var(--pk)}
-.ov{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(8,8,10,.8);backdrop-filter:blur(4px)}
+.ov{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(8,8,10,.85);backdrop-filter:blur(4px)}
 .sp{width:32px;height:32px;border:3px solid var(--bd);border-top-color:var(--ac);border-radius:50%;animation:spin .8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 
-/* ── Mobile settings toggle ── */
 .mob-tgl{display:flex;position:sticky;bottom:12px;z-index:50;padding:0 12px;margin-top:8px}
 @media(min-width:900px){.mob-tgl{display:none}}
 .mob-tgl button{flex:1;padding:11px;border:none;border-radius:var(--r);background:var(--ac);color:#fff;
@@ -359,10 +423,8 @@ body{font-family:var(--f);background:var(--bg);color:var(--t1);min-height:100vh;
 .mob-in{background:var(--bg);border-top:1px solid var(--bd);border-radius:20px 20px 0 0;
   padding:16px 16px 28px;max-height:80vh;overflow-y:auto}
 .mob-bar{width:36px;height:4px;background:var(--bd);border-radius:2px;margin:0 auto 14px}
-
 .dsk{display:none}@media(min-width:900px){.dsk{display:block}}
 
-/* ── Panel ── */
 .pn{background:var(--s1);border:1px solid var(--bd);border-radius:var(--r);padding:18px}
 .pn h4{font-size:.68rem;text-transform:uppercase;letter-spacing:.1em;color:var(--t2);margin-bottom:12px;font-weight:600}
 .ps+.ps{margin-top:16px;padding-top:16px;border-top:1px solid var(--bd)}
@@ -377,6 +439,7 @@ body{font-family:var(--f);background:var(--bg);color:var(--t1);min-height:100vh;
 .sg{margin-bottom:12px}
 .sl{display:flex;justify-content:space-between;font-size:.75rem;color:var(--t2);margin-bottom:5px}
 .sl span:last-child{font-family:var(--m);color:var(--t1);font-size:.72rem}
+.sh{font-size:.65rem;color:var(--t3);margin-top:4px}
 input[type=range]{-webkit-appearance:none;width:100%;height:4px;border-radius:2px;background:var(--bd);outline:none}
 input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;
   background:var(--ac);cursor:pointer;border:2px solid var(--bg)}
@@ -401,7 +464,6 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;heigh
 .b2{background:var(--pk);color:#fff}.b2:hover{filter:brightness(1.12)}.b2:disabled{opacity:.3;cursor:not-allowed}
 .b3{background:linear-gradient(135deg,var(--ac),var(--pk));color:#fff}.b3:hover{filter:brightness(1.1)}.b3:disabled{opacity:.3;cursor:not-allowed}
 .bg0{background:var(--s2);color:var(--t2);border:1px solid var(--bd)}.bg0:hover{border-color:var(--bdh);color:var(--t1)}
-
 .ft{text-align:center;margin-top:44px;font-size:.7rem;color:var(--t3);line-height:1.7}
       `}</style>
 
@@ -416,7 +478,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;heigh
           <p>{t.sub}</p>
           <div className="badge">
             <span className={`dot ${status === "loading-model" ? "ld" : status === "error" ? "er" : ""}`} />
-            {status === "loading-model" ? t.loading : modelLoaded ? t.ready : t.wait}
+            {status === "loading-model" ? t.loading : modelsLoaded ? t.ready : t.wait}
           </div>
         </header>
 
@@ -459,7 +521,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;heigh
           </>
         )}
 
-        <div className="ft">{t.footer}<br />Powered by face-api.js + Next.js</div>
+        <div className="ft">{t.footer}<br />Powered by face-api.js + MediaPipe + Next.js</div>
       </div>
     </>
   );
