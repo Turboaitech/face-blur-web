@@ -1,11 +1,17 @@
 export const metadata = {
-  title: "人脸模糊工具 | Face Blur Tool",
-  description: "在线人脸模糊工具，纯前端处理，保护隐私",
+  title: "Face Blur & Isolate Tool",
+  description: "Auto-detect faces: blur them or isolate on white background. 100% browser-side.",
+};
+
+export const viewport = {
+  width: "device-width",
+  initialScale: 1,
+  maximumScale: 1,
 };
 
 export default function RootLayout({ children }) {
   return (
-    <html lang="zh-CN">
+    <html lang="en">
       <body>{children}</body>
     </html>
   );
