@@ -5,6 +5,103 @@ import { useState, useRef, useCallback, useEffect } from "react";
 const FACE_MODEL_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.12/model/";
 const SEG_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite";
 const SEG_WASM_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm";
+const OCR_MIN_WORD_CONFIDENCE = 18;
+const OCR_MIN_LINE_CONFIDENCE = 12;
+const OCR_MERGE_GAP = 10;
+
+function normalizeRegion(bbox, imgWidth, imgHeight, scale = 1, padXRatio = 0.12, padYRatio = 0.2) {
+  if (!bbox) return null;
+  const rawX0 = Number.isFinite(bbox.x0) ? bbox.x0 / scale : 0;
+  const rawY0 = Number.isFinite(bbox.y0) ? bbox.y0 / scale : 0;
+  const rawX1 = Number.isFinite(bbox.x1) ? bbox.x1 / scale : 0;
+  const rawY1 = Number.isFinite(bbox.y1) ? bbox.y1 / scale : 0;
+  const width = Math.max(0, rawX1 - rawX0);
+  const height = Math.max(0, rawY1 - rawY0);
+  if (width < 6 || height < 6) return null;
+
+  const padX = Math.max(4, width * padXRatio);
+  const padY = Math.max(3, height * padYRatio);
+  const x = Math.max(0, rawX0 - padX);
+  const y = Math.max(0, rawY0 - padY);
+  const w = Math.min(imgWidth - x, width + padX * 2);
+  const h = Math.min(imgHeight - y, height + padY * 2);
+  if (w < 6 || h < 6) return null;
+  return { x, y, w, h };
+}
+
+function regionsTouch(a, b, gap = OCR_MERGE_GAP) {
+  return (
+    a.x <= b.x + b.w + gap &&
+    a.x + a.w + gap >= b.x &&
+    a.y <= b.y + b.h + gap &&
+    a.y + a.h + gap >= b.y
+  );
+}
+
+function mergeRegions(regions) {
+  const pending = regions
+    .filter(Boolean)
+    .map((region) => ({ ...region }))
+    .sort((a, b) => a.y - b.y || a.x - b.x);
+
+  const merged = [];
+  for (const region of pending) {
+    const hit = merged.find((item) => regionsTouch(item, region));
+    if (!hit) {
+      merged.push(region);
+      continue;
+    }
+    const x0 = Math.min(hit.x, region.x);
+    const y0 = Math.min(hit.y, region.y);
+    const x1 = Math.max(hit.x + hit.w, region.x + region.w);
+    const y1 = Math.max(hit.y + hit.h, region.y + region.h);
+    hit.x = x0;
+    hit.y = y0;
+    hit.w = x1 - x0;
+    hit.h = y1 - y0;
+  }
+  return merged;
+}
+
+function buildOcrCanvas(img, scale = 1, threshold = null) {
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(img.width * scale));
+  canvas.height = Math.max(1, Math.round(img.height * scale));
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+  if (threshold !== null) {
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const { data } = imageData;
+    for (let i = 0; i < data.length; i += 4) {
+      const luminance = data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+      const value = luminance >= threshold ? 255 : 0;
+      data[i] = value;
+      data[i + 1] = value;
+      data[i + 2] = value;
+    }
+    ctx.putImageData(imageData, 0, 0);
+  }
+
+  return canvas;
+}
+
+function collectTextRegions(data, imgWidth, imgHeight, scale = 1) {
+  const regions = [];
+  for (const word of data.words || []) {
+    if (!word?.text?.trim() || (word.confidence ?? 0) < OCR_MIN_WORD_CONFIDENCE) continue;
+    const region = normalizeRegion(word.bbox, imgWidth, imgHeight, scale, 0.15, 0.24);
+    if (region) regions.push(region);
+  }
+
+  for (const line of data.lines || []) {
+    if (!line?.text?.trim() || (line.confidence ?? 0) < OCR_MIN_LINE_CONFIDENCE) continue;
+    const region = normalizeRegion(line.bbox, imgWidth, imgHeight, scale, 0.05, 0.18);
+    if (region) regions.push(region);
+  }
+
+  return mergeRegions(regions);
+}
 
 const L = {
   en: {
@@ -20,6 +117,7 @@ const L = {
     blurTextHelp: "Auto-detect visible words and blur them in the blurred output",
     textFound: "Text regions",
     textDetecting: "Detecting text…",
+    textFailed: "Text detection failed. OCR may be blocked or unsupported in this browser.",
     isoSettings: "Isolation Settings",
     threshold: "Edge Threshold",
     thresholdHelp: "Higher = tighter cut, Lower = more included",
@@ -45,6 +143,7 @@ const L = {
     blurTextHelp: "自动检测可见文字，并在模糊输出中一起处理",
     textFound: "文字区域",
     textDetecting: "正在检测文字…",
+    textFailed: "文字检测失败，当前浏览器可能不支持或拦截了 OCR 资源。",
     isoSettings: "抠图设置",
     threshold: "边缘阈值",
     thresholdHelp: "越高越紧贴轮廓，越低包含越多",
@@ -68,6 +167,8 @@ export default function App() {
   const [faces, setFaces] = useState([]);
   const [segMask, setSegMask] = useState(null); // Float32Array of confidence per pixel
   const [textBoxes, setTextBoxes] = useState([]);
+  const [textStatus, setTextStatus] = useState("idle");
+  const [textError, setTextError] = useState("");
   const [blurMode, setBlurMode] = useState("gaussian");
   const [blurStrength, setBlurStrength] = useState(40);
   const [blurExpand, setBlurExpand] = useState(0.3);
@@ -128,35 +229,47 @@ export default function App() {
   useEffect(() => { loadModels(); }, [loadModels]);
 
   const detectTextRegions = useCallback(async (img) => {
+    setTextStatus("detecting");
+    setTextError("");
     try {
       const Tesseract = await import("tesseract.js");
-      const { data } = await Tesseract.recognize(img, "eng+chi_sim", {
-        logger: () => {},
-      });
-      const regions = [];
-      for (const word of (data.words || [])) {
-        if (word.confidence < 40) continue;
-        const { x0, y0, x1, y1 } = word.bbox;
-        const padX = Math.max(4, (x1 - x0) * 0.1);
-        const padY = Math.max(3, (y1 - y0) * 0.15);
-        regions.push({
-          x: Math.max(0, x0 - padX),
-          y: Math.max(0, y0 - padY),
-          w: Math.min(img.width - Math.max(0, x0 - padX), (x1 - x0) + padX * 2),
-          h: Math.min(img.height - Math.max(0, y0 - padY), (y1 - y0) + padY * 2),
-        });
+      const languageCandidates = lang === "zh" ? ["eng+chi_sim", "eng"] : ["eng"];
+      const passes = [
+        { image: img, scale: 1 },
+        { image: buildOcrCanvas(img, 2, 168), scale: 2 },
+      ];
+
+      let lastError = null;
+      for (const languages of languageCandidates) {
+        try {
+          const passRegions = [];
+          for (const pass of passes) {
+            const { data } = await Tesseract.recognize(pass.image, languages, {
+              logger: () => {},
+            });
+            passRegions.push(...collectTextRegions(data, img.width, img.height, pass.scale));
+          }
+          const merged = mergeRegions(passRegions);
+          setTextStatus("done");
+          return merged;
+        } catch (e) {
+          lastError = e;
+        }
       }
-      return regions;
+
+      throw lastError || new Error("OCR unavailable");
     } catch (e) {
       console.warn("Text detection failed", e);
+      setTextStatus("error");
+      setTextError(t.textFailed);
       return [];
     }
-  }, []);
+  }, [lang, t.textFailed]);
 
   // ── Handle image ───────────────────────────────────────────────────────────
   const handleImage = useCallback(async (file) => {
     if (!file || !file.type.startsWith("image/")) return;
-    setFaces([]); setSegMask(null); setTextBoxes([]); setStatus("detecting"); setErrorMsg("");
+    setFaces([]); setSegMask(null); setTextBoxes([]); setTextStatus("idle"); setTextError(""); setStatus("detecting"); setErrorMsg("");
     const url = URL.createObjectURL(file); setImage(url);
 
     const img = new Image();
@@ -374,7 +487,7 @@ export default function App() {
   const toggleFace = (i) => setFaces(p => p.map((f, j) => j === i ? { ...f, enabled: !f.enabled } : f));
   const dl = (c, name) => { if (!c) return; const a = document.createElement("a"); a.download = name; a.href = c.toDataURL("image/png"); a.click(); };
   const dlBoth = () => { dl(blurCanvasRef.current, "blurred.png"); setTimeout(() => dl(isoCanvasRef.current, "isolated.png"), 300); };
-  const reset = () => { setImage(null); setFaces([]); setSegMask(null); setTextBoxes([]); setStatus(modelsLoaded ? "ready" : "idle"); setErrorMsg(""); setPanelOpen(false); };
+  const reset = () => { setImage(null); setFaces([]); setSegMask(null); setTextBoxes([]); setTextStatus("idle"); setTextError(""); setStatus(modelsLoaded ? "ready" : "idle"); setErrorMsg(""); setPanelOpen(false); };
 
   const onDragOver = (e) => { e.preventDefault(); setDragOver(true); };
   const onDragLeave = () => setDragOver(false);
@@ -408,7 +521,10 @@ export default function App() {
             <span>{t.blurText}</span>
           </label>
           <div className="sh">{t.blurTextHelp}</div>
-          <div className="sh">{t.textFound}: {textBoxes.length}</div>
+          <div className="sh">
+            {textStatus === "detecting" ? t.textDetecting : `${t.textFound}: ${textBoxes.length}`}
+          </div>
+          {textError && <div className="sh">{textError}</div>}
         </div>
       </div>
       <div className="ps">
