@@ -16,6 +16,10 @@ const L = {
     blurred: "Blurred", isolated: "Face Only (White BG)",
     blurSettings: "Blur Settings", gaussian: "Gaussian", mosaic: "Mosaic", blackout: "Blackout",
     strength: "Strength", range: "Range",
+    blurText: "Blur Text",
+    blurTextHelp: "Auto-detect visible words and blur them in the blurred output",
+    textFound: "Text regions",
+    textUnsupported: "Text detection depends on browser support",
     isoSettings: "Isolation Settings",
     threshold: "Edge Threshold",
     thresholdHelp: "Higher = tighter cut, Lower = more included",
@@ -37,6 +41,10 @@ const L = {
     blurred: "模糊版", isolated: "仅人脸（白底）",
     blurSettings: "模糊设置", gaussian: "高斯模糊", mosaic: "像素马赛克", blackout: "纯黑遮挡",
     strength: "模糊强度", range: "模糊范围",
+    blurText: "模糊文字",
+    blurTextHelp: "自动检测可见文字，并在模糊输出中一起处理",
+    textFound: "文字区域",
+    textUnsupported: "文字检测取决于浏览器支持",
     isoSettings: "抠图设置",
     threshold: "边缘阈值",
     thresholdHelp: "越高越紧贴轮廓，越低包含越多",
@@ -59,9 +67,11 @@ export default function App() {
   const [image, setImage] = useState(null);
   const [faces, setFaces] = useState([]);
   const [segMask, setSegMask] = useState(null); // Float32Array of confidence per pixel
+  const [textBoxes, setTextBoxes] = useState([]);
   const [blurMode, setBlurMode] = useState("gaussian");
   const [blurStrength, setBlurStrength] = useState(40);
   const [blurExpand, setBlurExpand] = useState(0.3);
+  const [blurText, setBlurText] = useState(true);
   const [isoThreshold, setIsoThreshold] = useState(0.5);
   const [isoExpand, setIsoExpand] = useState(0.35);
   const [morphIter, setMorphIter] = useState(1);
@@ -83,6 +93,7 @@ export default function App() {
     { id: "mosaic", label: t.mosaic, icon: "▦" },
     { id: "black", label: t.blackout, icon: "■" },
   ];
+  const textDetectionSupported = typeof window !== "undefined" && "TextDetector" in window;
 
   // ── Load both models ───────────────────────────────────────────────────────
   const loadModels = useCallback(async () => {
@@ -117,10 +128,35 @@ export default function App() {
 
   useEffect(() => { loadModels(); }, [loadModels]);
 
+  const detectTextRegions = useCallback(async (img) => {
+    if (!textDetectionSupported) return [];
+    try {
+      const detector = new window.TextDetector();
+      const detections = await detector.detect(img);
+      return detections
+        .map((item) => {
+          const box = item?.boundingBox;
+          if (!box) return null;
+          const padX = Math.max(6, box.width * 0.08);
+          const padY = Math.max(4, box.height * 0.2);
+          return {
+            x: Math.max(0, box.x - padX),
+            y: Math.max(0, box.y - padY),
+            w: Math.max(1, Math.min(img.width - Math.max(0, box.x - padX), box.width + padX * 2)),
+            h: Math.max(1, Math.min(img.height - Math.max(0, box.y - padY), box.height + padY * 2)),
+          };
+        })
+        .filter(Boolean);
+    } catch (e) {
+      console.warn("Text detection failed", e);
+      return [];
+    }
+  }, [textDetectionSupported]);
+
   // ── Handle image ───────────────────────────────────────────────────────────
   const handleImage = useCallback(async (file) => {
     if (!file || !file.type.startsWith("image/")) return;
-    setFaces([]); setSegMask(null); setStatus("detecting"); setErrorMsg("");
+    setFaces([]); setSegMask(null); setTextBoxes([]); setStatus("detecting"); setErrorMsg("");
     const url = URL.createObjectURL(file); setImage(url);
 
     const img = new Image();
@@ -134,10 +170,14 @@ export default function App() {
 
       try {
         // 1. Face detection for blur
-        const det = await faceApi.detectAllFaces(img, new faceApi.SsdMobilenetv1Options({ minConfidence: 0.3 }));
+        const [det, detectedText] = await Promise.all([
+          faceApi.detectAllFaces(img, new faceApi.SsdMobilenetv1Options({ minConfidence: 0.3 })),
+          detectTextRegions(img),
+        ]);
         const boxes = det.map(d => ({ x: d.box.x, y: d.box.y, w: d.box.width, h: d.box.height, enabled: true }));
         setFaces(boxes);
-        if (!boxes.length) setErrorMsg(t.noFaceHint);
+        setTextBoxes(detectedText);
+        if (!boxes.length && !detectedText.length) setErrorMsg(t.noFaceHint);
 
         // 2. Person segmentation for isolation
         const result = segmenter.segment(img);
@@ -151,38 +191,70 @@ export default function App() {
       } catch (e) { console.error(e); setErrorMsg(e.message); setStatus("error"); }
     };
     img.src = url;
-  }, [faceApi, segmenter, t.noFaceHint]);
+  }, [detectTextRegions, faceApi, segmenter, t.noFaceHint]);
 
   // ── Render blur canvas ─────────────────────────────────────────────────────
-  const renderBlur = useCallback((img, canvas, faceBoxes, mode, strength, expand) => {
+  const renderBlur = useCallback((img, canvas, faceBoxes, textRegions, mode, strength, expand, shouldBlurText) => {
     if (!img || !canvas) return;
-    const ctx = canvas.getContext("2d"); ctx.drawImage(img, 0, 0);
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(img, 0, 0);
+
+    const applyMaskedRegion = (shape, x, y, w, h) => {
+      if (mode === "gaussian") {
+        ctx.save(); ctx.beginPath();
+        if (shape === "ellipse") {
+          ctx.ellipse(x + w / 2, y + h / 2, w / 2, h / 2, 0, 0, Math.PI * 2);
+        } else {
+          ctx.rect(x, y, w, h);
+        }
+        ctx.clip();
+        for (let i = 0; i < Math.ceil(strength / 5); i++) {
+          ctx.filter = `blur(${Math.min(strength, 50)}px)`;
+          ctx.drawImage(canvas, x - 50, y - 50, w + 100, h + 100, x - 50, y - 50, w + 100, h + 100);
+        }
+        ctx.filter = "none";
+        ctx.restore();
+      } else if (mode === "mosaic") {
+        const bs = Math.max(5, Math.ceil(strength / 3));
+        const tc = document.createElement("canvas"); tc.width = w; tc.height = h;
+        tc.getContext("2d").drawImage(canvas, x, y, w, h, 0, 0, w, h);
+        const sw = Math.max(1, Math.floor(w / bs)), sh = Math.max(1, Math.floor(h / bs));
+        const sc = document.createElement("canvas"); sc.width = sw; sc.height = sh;
+        const sctx = sc.getContext("2d"); sctx.imageSmoothingEnabled = false; sctx.drawImage(tc, 0, 0, sw, sh);
+        ctx.save(); ctx.beginPath();
+        if (shape === "ellipse") {
+          ctx.ellipse(x + w / 2, y + h / 2, w / 2, h / 2, 0, 0, Math.PI * 2);
+        } else {
+          ctx.rect(x, y, w, h);
+        }
+        ctx.clip();
+        ctx.imageSmoothingEnabled = false; ctx.drawImage(sc, 0, 0, sw, sh, x, y, w, h);
+        ctx.imageSmoothingEnabled = true; ctx.restore();
+      } else {
+        ctx.save(); ctx.fillStyle = "#000"; ctx.beginPath();
+        if (shape === "ellipse") {
+          ctx.ellipse(x + w / 2, y + h / 2, w / 2, h / 2, 0, 0, Math.PI * 2);
+        } else {
+          ctx.rect(x, y, w, h);
+        }
+        ctx.fill(); ctx.restore();
+      }
+    };
+
     for (const f of faceBoxes.filter(f => f.enabled)) {
       const ex = f.w * expand, ey = f.h * expand;
       const fx = Math.max(0, f.x - ex), fy = Math.max(0, f.y - ey);
       const fw = Math.min(img.width - fx, f.w + ex * 2), fh = Math.min(img.height - fy, f.h + ey * 2);
-      if (mode === "gaussian") {
-        ctx.save(); ctx.beginPath();
-        ctx.ellipse(fx + fw / 2, fy + fh / 2, fw / 2, fh / 2, 0, 0, Math.PI * 2); ctx.clip();
-        for (let i = 0; i < Math.ceil(strength / 5); i++) {
-          ctx.filter = `blur(${Math.min(strength, 50)}px)`;
-          ctx.drawImage(canvas, fx - 50, fy - 50, fw + 100, fh + 100, fx - 50, fy - 50, fw + 100, fh + 100);
-        }
-        ctx.filter = "none"; ctx.restore();
-      } else if (mode === "mosaic") {
-        const bs = Math.max(5, Math.ceil(strength / 3));
-        const tc = document.createElement("canvas"); tc.width = fw; tc.height = fh;
-        tc.getContext("2d").drawImage(canvas, fx, fy, fw, fh, 0, 0, fw, fh);
-        const sw = Math.max(1, Math.floor(fw / bs)), sh = Math.max(1, Math.floor(fh / bs));
-        const sc = document.createElement("canvas"); sc.width = sw; sc.height = sh;
-        const sctx = sc.getContext("2d"); sctx.imageSmoothingEnabled = false; sctx.drawImage(tc, 0, 0, sw, sh);
-        ctx.save(); ctx.beginPath();
-        ctx.ellipse(fx + fw / 2, fy + fh / 2, fw / 2, fh / 2, 0, 0, Math.PI * 2); ctx.clip();
-        ctx.imageSmoothingEnabled = false; ctx.drawImage(sc, 0, 0, sw, sh, fx, fy, fw, fh);
-        ctx.imageSmoothingEnabled = true; ctx.restore();
-      } else {
-        ctx.save(); ctx.fillStyle = "#000"; ctx.beginPath();
-        ctx.ellipse(fx + fw / 2, fy + fh / 2, fw / 2, fh / 2, 0, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+      applyMaskedRegion("ellipse", fx, fy, fw, fh);
+    }
+
+    if (shouldBlurText) {
+      for (const region of textRegions) {
+        const tx = Math.max(0, Math.floor(region.x));
+        const ty = Math.max(0, Math.floor(region.y));
+        const tw = Math.max(1, Math.min(img.width - tx, Math.ceil(region.w)));
+        const th = Math.max(1, Math.min(img.height - ty, Math.ceil(region.h)));
+        applyMaskedRegion("rect", tx, ty, tw, th);
       }
     }
   }, []);
@@ -293,16 +365,16 @@ export default function App() {
   // ── Re-render on changes ───────────────────────────────────────────────────
   useEffect(() => {
     if (status === "done" && imgRef.current) {
-      renderBlur(imgRef.current, blurCanvasRef.current, faces, blurMode, blurStrength, blurExpand);
+      renderBlur(imgRef.current, blurCanvasRef.current, faces, textBoxes, blurMode, blurStrength, blurExpand, blurText);
       renderIsolate(imgRef.current, isoCanvasRef.current, segMask, faces, isoThreshold, isoExpand, morphIter);
     }
-  }, [status, faces, segMask, blurMode, blurStrength, blurExpand, isoThreshold, isoExpand, morphIter, renderBlur, renderIsolate]);
+  }, [status, faces, textBoxes, segMask, blurMode, blurStrength, blurExpand, blurText, isoThreshold, isoExpand, morphIter, renderBlur, renderIsolate]);
 
   // ── Actions ────────────────────────────────────────────────────────────────
   const toggleFace = (i) => setFaces(p => p.map((f, j) => j === i ? { ...f, enabled: !f.enabled } : f));
   const dl = (c, name) => { if (!c) return; const a = document.createElement("a"); a.download = name; a.href = c.toDataURL("image/png"); a.click(); };
   const dlBoth = () => { dl(blurCanvasRef.current, "blurred.png"); setTimeout(() => dl(isoCanvasRef.current, "isolated.png"), 300); };
-  const reset = () => { setImage(null); setFaces([]); setSegMask(null); setStatus(modelsLoaded ? "ready" : "idle"); setErrorMsg(""); setPanelOpen(false); };
+  const reset = () => { setImage(null); setFaces([]); setSegMask(null); setTextBoxes([]); setStatus(modelsLoaded ? "ready" : "idle"); setErrorMsg(""); setPanelOpen(false); };
 
   const onDragOver = (e) => { e.preventDefault(); setDragOver(true); };
   const onDragLeave = () => setDragOver(false);
@@ -313,6 +385,7 @@ export default function App() {
   }, [handleImage]);
 
   const hasEnabled = faces.some(f => f.enabled);
+  const hasBlurTargets = hasEnabled || (blurText && textBoxes.length > 0);
 
   const panel = (
     <div className="pn">
@@ -330,6 +403,12 @@ export default function App() {
             <input type="range" min="5" max="80" value={blurStrength} onChange={e => setBlurStrength(+e.target.value)} /></div>
           <div className="sg"><div className="sl"><span>{t.range}</span><span>{Math.round(blurExpand * 100)}%</span></div>
             <input type="range" min="0" max="80" value={blurExpand * 100} onChange={e => setBlurExpand(+e.target.value / 100)} /></div>
+          <label className="tg">
+            <input type="checkbox" checked={blurText} onChange={e => setBlurText(e.target.checked)} />
+            <span>{t.blurText}</span>
+          </label>
+          <div className="sh">{t.blurTextHelp}</div>
+          <div className="sh">{t.textFound}: {textBoxes.length}{!textDetectionSupported ? ` · ${t.textUnsupported}` : ""}</div>
         </div>
       </div>
       <div className="ps">
@@ -360,7 +439,7 @@ export default function App() {
       {errorMsg && <div className="em">{errorMsg}</div>}
       <div className="bts">
         <div className="bt">
-          <button className="bn b1" onClick={() => dl(blurCanvasRef.current, "blurred.png")} disabled={status !== "done" || !hasEnabled}>{t.dlBlur}</button>
+          <button className="bn b1" onClick={() => dl(blurCanvasRef.current, "blurred.png")} disabled={status !== "done" || !hasBlurTargets}>{t.dlBlur}</button>
           <button className="bn b2" onClick={() => dl(isoCanvasRef.current, "isolated.png")} disabled={status !== "done" || !segMask}>{t.dlIso}</button>
         </div>
         <button className="bn b3" onClick={dlBoth} disabled={status !== "done"}>{t.dlBoth}</button>
@@ -462,8 +541,10 @@ body{font-family:var(--f);background:var(--bg);color:var(--t1);min-height:100vh;
 .sg{margin-bottom:12px}
 .sl{display:flex;justify-content:space-between;font-size:.75rem;color:var(--t2);margin-bottom:5px}
 .sl span:last-child{font-family:var(--m);color:var(--t1);font-size:.72rem}
-.sh{font-size:.65rem;color:var(--t3);margin-top:4px}
-input[type=range]{-webkit-appearance:none;width:100%;height:4px;border-radius:2px;background:var(--bd);outline:none}
+	.sh{font-size:.65rem;color:var(--t3);margin-top:4px}
+	.tg{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:.76rem;color:var(--t2);cursor:pointer}
+	.tg input{accent-color:var(--ac)}
+	input[type=range]{-webkit-appearance:none;width:100%;height:4px;border-radius:2px;background:var(--bd);outline:none}
 input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;
   background:var(--ac);cursor:pointer;border:2px solid var(--bg)}
 
