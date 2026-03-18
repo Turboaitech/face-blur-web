@@ -8,12 +8,12 @@ const SEG_WASM_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@lates
 
 const L = {
   en: {
-    title: "Face Blur & Isolate",
-    sub: "Upload an image — faces are auto-detected. Simultaneously generates a blurred version and a pixel-accurate white-background isolation.",
+    title: "Face Blur & Extract",
+    sub: "Upload an image — faces are auto-detected, blurred, and extracted (face only, white background). 100% browser-side, nothing uploaded.",
     loading: "Loading models…", ready: "Models ready", wait: "Initializing…",
     upload: "Click to select image, or drag & drop here",
     hint: "JPG / PNG / WebP", paste: "paste screenshot",
-    blurred: "Blurred", isolated: "Isolated (White BG)",
+    blurred: "Blurred", isolated: "Face Only (White BG)",
     blurSettings: "Blur Settings", gaussian: "Gaussian", mosaic: "Mosaic", blackout: "Blackout",
     strength: "Strength", range: "Range",
     isoSettings: "Isolation Settings",
@@ -24,17 +24,17 @@ const L = {
     morphClose: "Edge Smoothing",
     faces: "Detected Faces", face: "Face", detecting: "Processing…",
     noFace: "No faces detected", noFaceHint: "Try a clearer photo",
-    dlBlur: "Download Blurred", dlIso: "Download Isolated", dlBoth: "Download Both",
+    dlBlur: "Download Blurred", dlIso: "Download Face", dlBoth: "Download Both",
     reselect: "Choose Another Image", settings: "Settings",
     footer: "100% client-side · Images never leave your browser",
   },
   zh: {
-    title: "人脸模糊 & 白底抠图",
-    sub: "上传图片 → 自动检测 → 同时生成模糊版和精确白底抠图版。像素级分割，全程浏览器处理。",
+    title: "人脸模糊 & 人脸提取",
+    sub: "上传图片 → 自动检测 → 模糊处理 + 仅提取人脸（白色背景）。全程浏览器处理，图片不上传。",
     loading: "模型加载中…", ready: "模型就绪", wait: "初始化中…",
     upload: "点击选择图片，或拖拽到此处",
     hint: "JPG / PNG / WebP", paste: "粘贴截图",
-    blurred: "模糊版", isolated: "白底抠图版",
+    blurred: "模糊版", isolated: "仅人脸（白底）",
     blurSettings: "模糊设置", gaussian: "高斯模糊", mosaic: "像素马赛克", blackout: "纯黑遮挡",
     strength: "模糊强度", range: "模糊范围",
     isoSettings: "抠图设置",
@@ -45,7 +45,7 @@ const L = {
     morphClose: "边缘平滑",
     faces: "检测到的人脸", face: "人脸", detecting: "处理中…",
     noFace: "未检测到人脸", noFaceHint: "可尝试换一张更清晰的照片",
-    dlBlur: "下载模糊版", dlIso: "下载白底版", dlBoth: "全部下载",
+    dlBlur: "下载模糊版", dlIso: "下载人脸", dlBoth: "全部下载",
     reselect: "重选图片", settings: "设置",
     footer: "纯前端处理 · 图片不会离开你的浏览器",
   },
@@ -205,13 +205,13 @@ export default function App() {
     const enabledFaces = faceBoxes.filter(f => f.enabled);
     const regionMask = new Uint8Array(W * H);
     for (const f of enabledFaces) {
-      // Expand the face box to include hair and chin — face only, not body
+      // Expand the face box to include hair and chin — face only, no body
       const ex = f.w * expand;
       const ey = f.h * expand;
-      const x0 = Math.max(0, Math.floor(f.x - ex));
-      const y0 = Math.max(0, Math.floor(f.y - ey * 0.8)); // above for hair/forehead
-      const x1 = Math.min(W, Math.ceil(f.x + f.w + ex));
-      const y1 = Math.min(H, Math.ceil(f.y + f.h + ey * 0.5)); // minimal below — chin only, no body
+      const x0 = Math.max(0, Math.floor(f.x - ex * 0.8));
+      const y0 = Math.max(0, Math.floor(f.y - ey * 1.0)); // above for hair/forehead
+      const x1 = Math.min(W, Math.ceil(f.x + f.w + ex * 0.8));
+      const y1 = Math.min(H, Math.ceil(f.y + f.h + ey * 0.3)); // just chin, no neck/body
       for (let y = y0; y < y1; y++) {
         for (let x = x0; x < x1; x++) {
           regionMask[y * W + x] = 1;
